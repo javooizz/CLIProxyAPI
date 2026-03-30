@@ -14,8 +14,8 @@ func init() {
 	ConfigureCacheSimForModel("claude-opus", CacheSimConfig{
 		CacheReadMultiplier:      1.12,
 		CacheReadJitter:          0.08,
-		CacheCreationProbability: 0.55,
-		CacheCreationRate:        0.06,
+		CacheCreationProbability: 0.35,
+		CacheCreationRate:        0.08,
 		CacheHitInputRate:        0.005,
 		CacheMissInputRate:       0.03,
 		CacheMissRate:            0.05,
@@ -23,10 +23,10 @@ func init() {
 
 	// Sonnet: mid-tier model, balanced cache behavior.
 	ConfigureCacheSimForModel("claude-sonnet", CacheSimConfig{
-		CacheReadMultiplier:      1.15,
+		CacheReadMultiplier:      1.10,
 		CacheReadJitter:          0.08,
-		CacheCreationProbability: 0.55,
-		CacheCreationRate:        0.06,
+		CacheCreationProbability: 0.3,
+		CacheCreationRate:        0.12,
 		CacheHitInputRate:        0.005,
 		CacheMissInputRate:       0.03,
 		CacheMissRate:            0.05,
@@ -34,10 +34,10 @@ func init() {
 
 	// Haiku: lightweight model, high cache hit rate, minimal creation.
 	ConfigureCacheSimForModel("claude-haiku", CacheSimConfig{
-		CacheReadMultiplier:      1.08,
+		CacheReadMultiplier:      1.10,
 		CacheReadJitter:          0.06,
-		CacheCreationProbability: 0.35,
-		CacheCreationRate:        0.05,
+		CacheCreationProbability: 0.65,
+		CacheCreationRate:        0.10,
 		CacheHitInputRate:        0.004,
 		CacheMissInputRate:       0.02,
 		CacheMissRate:            0.03,
