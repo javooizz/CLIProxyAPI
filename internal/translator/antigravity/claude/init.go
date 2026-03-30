@@ -12,35 +12,35 @@ func init() {
 	//
 	// Opus: expensive model, higher cache_creation rate per hit, moderate probability.
 	ConfigureCacheSimForModel("claude-opus", CacheSimConfig{
-		CacheReadMultiplier:      1.10,
+		CacheReadMultiplier:      1.12,
 		CacheReadJitter:          0.08,
-		CacheCreationProbability: 0.30,
-		CacheCreationRate:        0.08,
+		CacheCreationProbability: 0.45,
+		CacheCreationRate:        0.10,
 		CacheHitInputRate:        0.005,
 		CacheMissInputRate:       0.03,
-		CacheMissRate:            0.05,
+		CacheMissRate:            0.06,
 	})
 
 	// Sonnet: mid-tier model, balanced cache behavior.
 	ConfigureCacheSimForModel("claude-sonnet", CacheSimConfig{
-		CacheReadMultiplier:      1.10,
+		CacheReadMultiplier:      1.12,
 		CacheReadJitter:          0.08,
-		CacheCreationProbability: 0.30,
+		CacheCreationProbability: 0.45,
 		CacheCreationRate:        0.10,
 		CacheHitInputRate:        0.005,
 		CacheMissInputRate:       0.03,
-		CacheMissRate:            0.05,
+		CacheMissRate:            0.06,
 	})
 
 	// Haiku: lightweight model, high cache hit rate, minimal creation.
 	ConfigureCacheSimForModel("claude-haiku", CacheSimConfig{
-		CacheReadMultiplier:      1.10,
+		CacheReadMultiplier:      1.15,
 		CacheReadJitter:          0.06,
 		CacheCreationProbability: 0.65,
 		CacheCreationRate:        0.10,
 		CacheHitInputRate:        0.004,
 		CacheMissInputRate:       0.02,
-		CacheMissRate:            0.03,
+		CacheMissRate:            0.06,
 	})
 
 	translator.Register(
