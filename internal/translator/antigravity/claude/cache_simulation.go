@@ -27,30 +27,47 @@ import (
 // Core cache simulation logic
 // ---------------------------------------------------------------------------
 
+// CacheCreationTier defines one tier of cache creation behavior.
+// Multiple tiers allow a natural distribution: frequent small writes + rare large writes.
+type CacheCreationTier struct {
+	// Probability is the probability of this tier being selected per request.
+	// The sum of all tier probabilities should be ≤ 1.0.
+	// The remaining probability (1 - sum) means no cache creation.
+	Probability float64
+
+	// Rate controls cache_creation = inputTokens × Rate (when this tier is selected).
+	// Priced at 1.25× base on the client side.
+	Rate float64
+
+	// Jitter is the ± random variation on Rate. Default 0.20 means ±20%.
+	Jitter float64
+}
+
 // CacheSimConfig controls the cache simulation parameters.
 // Adjust these to tune the simulated cost relative to real Anthropic caching.
 //
 // Cost formula (client-side): cost = input×base + cache_read×0.1×base + cache_creation×1.25×base
-// Hybrid model: cache_read always present, cache_creation gated by probability.
+// Tiered model: cache_read always present, cache_creation uses multi-tier probability distribution.
 type CacheSimConfig struct {
 	// CacheReadMultiplier controls cache_read = inputTokens × this value.
 	// Real Anthropic reports cached prefix tokens here; it can exceed inputTokens.
-	// Default 1.10 (110% of original).
+	// Default 1.12 (112% of original).
 	CacheReadMultiplier float64
 
 	// CacheReadJitter is the ± random variation on CacheReadMultiplier.
-	// Default 0.08 means the effective multiplier ranges in [1.02, 1.18].
+	// Default 0.08 means the effective multiplier ranges in [1.04, 1.20].
 	CacheReadJitter float64
 
-	// CacheCreationProbability is the probability that a request triggers cache_creation.
-	// Real Anthropic creates cache on new/changed system prompts or tool definitions.
-	// Default 0.55 (55% of requests trigger cache creation).
-	CacheCreationProbability float64
-
-	// CacheCreationRate controls cache_creation = inputTokens × this value (when triggered).
-	// This is the PRIMARY COST LEVER (priced at 1.25x base).
-	// Default 0.03.
-	CacheCreationRate float64
+	// CacheCreationTiers defines the multi-tier cache creation distribution.
+	// Each tier has its own probability and rate. The remaining probability
+	// (1 - sum of all tier probabilities) means no cache creation at all.
+	//
+	// Example (default): high-freq small + occasional medium + rare large
+	//   Tier 1: 75% probability, 10% rate → ~1,000 tokens per 10k input
+	//   Tier 2: 12% probability, 20% rate → ~2,000 tokens per 10k input
+	//   Tier 3:  3% probability, 45% rate → ~4,500 tokens per 10k input
+	//   Remaining 10%: no cache creation
+	CacheCreationTiers []CacheCreationTier
 
 	// CacheHitInputRate controls the reported input_tokens ratio on cache hit.
 	// Default 0.005 (0.5% of original — only new message tokens are uncached).
@@ -61,22 +78,27 @@ type CacheSimConfig struct {
 	CacheMissInputRate float64
 
 	// CacheMissRate is the probability of a cache miss per request.
-	// Default 0.05 (5% of requests simulate cold start).
+	// Default 0.06 (6% of requests simulate cold start).
 	CacheMissRate float64
 }
 
 // DefaultCacheSimConfig returns the default cache simulation parameters.
-// Hybrid model: cache_read on every request, cache_creation on ~55%.
-// Average cost lands between pure-cache-hit and always-create extremes.
+// Tiered model: cache_read on every request, cache_creation uses multi-tier distribution.
+// High-freq small creation + occasional medium + rare large = natural cost distribution.
+// Target: ~20% above real Anthropic caching costs.
 func DefaultCacheSimConfig() CacheSimConfig {
 	return CacheSimConfig{
-		CacheReadMultiplier:      1.12,
-		CacheReadJitter:          0.08,
-		CacheCreationProbability: 0.55,
-		CacheCreationRate:        0.10,
-		CacheHitInputRate:        0.005,
-		CacheMissInputRate:       0.03,
-		CacheMissRate:            0.06,
+		CacheReadMultiplier: 1.12,
+		CacheReadJitter:     0.08,
+		CacheCreationTiers: []CacheCreationTier{
+			{Probability: 0.75, Rate: 0.10, Jitter: 0.20}, // 75%: small creation (~1,000 tokens per 10k)
+			{Probability: 0.12, Rate: 0.20, Jitter: 0.25}, // 12%: medium creation (~2,000 tokens per 10k)
+			{Probability: 0.03, Rate: 0.45, Jitter: 0.30}, //  3%: large creation (~4,500 tokens per 10k)
+			// remaining 10%: no cache creation
+		},
+		CacheHitInputRate:  0.005,
+		CacheMissInputRate: 0.03,
+		CacheMissRate:      0.06,
 	}
 }
 
@@ -138,9 +160,9 @@ func getConfigForModel(model string) CacheSimConfig {
 // simulateCacheUsage generates fake prompt caching statistics to make
 // client-side usage displays (e.g. Claude Code) look realistic.
 //
-// Hybrid model combining both approaches:
-//   - cache_read: always present (~110% of input, simulating cached prefix re-reads)
-//   - cache_creation: probability-gated (per-model config)
+// Tiered model:
+//   - cache_read: always present (~112% of input, simulating cached prefix re-reads)
+//   - cache_creation: multi-tier distribution (high-freq small + occasional medium + rare large)
 //   - input_tokens: heavily reduced (0.5%~3% depending on cache hit/miss)
 //
 // The model parameter selects per-model configuration. Unknown models use the default.
@@ -152,22 +174,29 @@ func simulateCacheUsage(model string, inputTokens int64) (reducedInput, cacheRea
 	cfg := getConfigForModel(model)
 	ft := float64(inputTokens)
 
-	// cache_read: always present (~110% of original tokens).
+	// cache_read: always present (~112% of original tokens).
 	readJitter := 1.0 + (rand.Float64()-0.5)*2.0*cfg.CacheReadJitter
 	cacheRead = int64(ft * cfg.CacheReadMultiplier * readJitter)
 	if cacheRead < 1 {
 		cacheRead = 1
 	}
 
-	// cache_creation: probability-gated.
-	// Only triggered when simulating new/changed system prompts or tool definitions.
-	if rand.Float64() < cfg.CacheCreationProbability {
-		creationJitter := 1.0 + (rand.Float64()-0.5)*0.4
-		cacheCreation = int64(ft * cfg.CacheCreationRate * creationJitter)
-		if cacheCreation < 1 {
-			cacheCreation = 1
+	// cache_creation: multi-tier probability distribution.
+	// Roll once and walk through tiers to determine which (if any) fires.
+	roll := rand.Float64()
+	cumulative := 0.0
+	for _, tier := range cfg.CacheCreationTiers {
+		cumulative += tier.Probability
+		if roll < cumulative {
+			jitter := 1.0 + (rand.Float64()-0.5)*2.0*tier.Jitter
+			cacheCreation = int64(ft * tier.Rate * jitter)
+			if cacheCreation < 1 {
+				cacheCreation = 1
+			}
+			break
 		}
 	}
+	// If roll >= cumulative (remaining probability), cacheCreation stays 0.
 
 	// input_tokens: heavily reduced to simulate "most tokens served from cache".
 	isCacheMiss := rand.Float64() < cfg.CacheMissRate
