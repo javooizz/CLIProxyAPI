@@ -15,6 +15,8 @@ import (
 	"bytes"
 	"context"
 	"math/rand"
+	"strings"
+	"sync"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -42,12 +44,12 @@ type CacheSimConfig struct {
 
 	// CacheCreationProbability is the probability that a request triggers cache_creation.
 	// Real Anthropic creates cache on new/changed system prompts or tool definitions.
-	// Default 0.15 (15% of requests trigger cache creation).
+	// Default 0.55 (55% of requests trigger cache creation).
 	CacheCreationProbability float64
 
 	// CacheCreationRate controls cache_creation = inputTokens × this value (when triggered).
 	// This is the PRIMARY COST LEVER (priced at 1.25x base).
-	// Default 0.10.
+	// Default 0.03.
 	CacheCreationRate float64
 
 	// CacheHitInputRate controls the reported input_tokens ratio on cache hit.
@@ -64,28 +66,73 @@ type CacheSimConfig struct {
 }
 
 // DefaultCacheSimConfig returns the default cache simulation parameters.
-// Hybrid model: cache_read on every request, cache_creation on ~15%.
+// Hybrid model: cache_read on every request, cache_creation on ~55%.
 // Average cost lands between pure-cache-hit and always-create extremes.
 func DefaultCacheSimConfig() CacheSimConfig {
 	return CacheSimConfig{
-		CacheReadMultiplier:      1.10,
+		CacheReadMultiplier:      1.12,
 		CacheReadJitter:          0.08,
 		CacheCreationProbability: 0.55,
-		CacheCreationRate:        0.03,
+		CacheCreationRate:        0.05,
 		CacheHitInputRate:        0.005,
 		CacheMissInputRate:       0.03,
 		CacheMissRate:            0.05,
 	}
 }
 
-// simConfig is the active cache simulation configuration.
-// Override via ConfigureCacheSim at startup.
-var simConfig = DefaultCacheSimConfig()
+// ---------------------------------------------------------------------------
+// Per-model configuration registry
+// ---------------------------------------------------------------------------
 
-// ConfigureCacheSim replaces the active cache simulation parameters.
-// Call this from server startup after loading config if you need custom tuning.
+// modelConfigs stores per-model cache simulation configurations.
+// Key: model name prefix (e.g. "claude-sonnet", "claude-opus").
+// Lookup order: exact match → prefix match → default.
+var (
+	modelConfigs   = make(map[string]CacheSimConfig)
+	modelConfigsMu sync.RWMutex
+	defaultConfig  = DefaultCacheSimConfig()
+)
+
+// ConfigureCacheSim sets the default cache simulation parameters (fallback for unknown models).
 func ConfigureCacheSim(cfg CacheSimConfig) {
-	simConfig = cfg
+	modelConfigsMu.Lock()
+	defer modelConfigsMu.Unlock()
+	defaultConfig = cfg
+}
+
+// ConfigureCacheSimForModel sets cache simulation parameters for a specific model.
+// The model key can be an exact model name (e.g. "claude-sonnet-4-20250514")
+// or a prefix (e.g. "claude-sonnet") to match model families.
+func ConfigureCacheSimForModel(model string, cfg CacheSimConfig) {
+	modelConfigsMu.Lock()
+	defer modelConfigsMu.Unlock()
+	modelConfigs[model] = cfg
+}
+
+// getConfigForModel returns the CacheSimConfig for the given model.
+// Lookup order: exact match → longest prefix match → default.
+func getConfigForModel(model string) CacheSimConfig {
+	modelConfigsMu.RLock()
+	defer modelConfigsMu.RUnlock()
+
+	// 1. Exact match
+	if cfg, ok := modelConfigs[model]; ok {
+		return cfg
+	}
+
+	// 2. Longest prefix match
+	bestKey := ""
+	for key := range modelConfigs {
+		if strings.HasPrefix(model, key) && len(key) > len(bestKey) {
+			bestKey = key
+		}
+	}
+	if bestKey != "" {
+		return modelConfigs[bestKey]
+	}
+
+	// 3. Default
+	return defaultConfig
 }
 
 // simulateCacheUsage generates fake prompt caching statistics to make
@@ -93,17 +140,16 @@ func ConfigureCacheSim(cfg CacheSimConfig) {
 //
 // Hybrid model combining both approaches:
 //   - cache_read: always present (~110% of input, simulating cached prefix re-reads)
-//   - cache_creation: probability-gated (~15% of requests trigger creation at ~10% rate)
+//   - cache_creation: probability-gated (per-model config)
 //   - input_tokens: heavily reduced (0.5%~3% depending on cache hit/miss)
 //
-// This produces realistic cost that sits between "always create" (too expensive)
-// and "never create" (too cheap).
-func simulateCacheUsage(inputTokens int64) (reducedInput, cacheRead, cacheCreation int64) {
+// The model parameter selects per-model configuration. Unknown models use the default.
+func simulateCacheUsage(model string, inputTokens int64) (reducedInput, cacheRead, cacheCreation int64) {
 	if inputTokens <= 10 {
 		return inputTokens, 0, 0
 	}
 
-	cfg := simConfig
+	cfg := getConfigForModel(model)
 	ft := float64(inputTokens)
 
 	// cache_read: always present (~110% of original tokens).
@@ -113,7 +159,7 @@ func simulateCacheUsage(inputTokens int64) (reducedInput, cacheRead, cacheCreati
 		cacheRead = 1
 	}
 
-	// cache_creation: probability-gated (~15% of requests).
+	// cache_creation: probability-gated.
 	// Only triggered when simulating new/changed system prompts or tool definitions.
 	if rand.Float64() < cfg.CacheCreationProbability {
 		creationJitter := 1.0 + (rand.Float64()-0.5)*0.4
@@ -136,8 +182,8 @@ func simulateCacheUsage(inputTokens int64) (reducedInput, cacheRead, cacheCreati
 		reducedInput = 1
 	}
 
-	log.Debugf("[CacheSim] simulateCacheUsage: inputTokens=%d -> reducedInput=%d, cacheRead=%d, cacheCreation=%d",
-		inputTokens, reducedInput, cacheRead, cacheCreation)
+	log.Debugf("[CacheSim] model=%s inputTokens=%d -> reducedInput=%d, cacheRead=%d, cacheCreation=%d",
+		model, inputTokens, reducedInput, cacheRead, cacheCreation)
 	return
 }
 
@@ -147,17 +193,17 @@ func simulateCacheUsage(inputTokens int64) (reducedInput, cacheRead, cacheCreati
 
 // injectCacheIntoSSEChunks post-processes a slice of SSE byte chunks,
 // injecting cache simulation into message_start and message_delta events.
-func injectCacheIntoSSEChunks(chunks [][]byte) [][]byte {
+func injectCacheIntoSSEChunks(model string, chunks [][]byte) [][]byte {
 	result := make([][]byte, 0, len(chunks))
 	for _, chunk := range chunks {
-		result = append(result, injectCacheIntoSSEChunk(chunk))
+		result = append(result, injectCacheIntoSSEChunk(model, chunk))
 	}
 	return result
 }
 
 // injectCacheIntoSSEChunk processes a single SSE chunk that may contain
 // multiple events separated by double-newlines.
-func injectCacheIntoSSEChunk(chunk []byte) []byte {
+func injectCacheIntoSSEChunk(model string, chunk []byte) []byte {
 	if len(chunk) == 0 {
 		return chunk
 	}
@@ -167,7 +213,7 @@ func injectCacheIntoSSEChunk(chunk []byte) []byte {
 	modified := false
 
 	for i, event := range events {
-		processed := processSSEEvent(event)
+		processed := processSSEEvent(model, event)
 		if processed != nil {
 			events[i] = processed
 			modified = true
@@ -183,7 +229,7 @@ func injectCacheIntoSSEChunk(chunk []byte) []byte {
 
 // processSSEEvent examines a single SSE event and injects cache fields
 // if it's a message_start or message_delta event. Returns nil if no change.
-func processSSEEvent(event []byte) []byte {
+func processSSEEvent(model string, event []byte) []byte {
 	// Find the "data: " line within the event
 	dataPrefix := []byte("data: ")
 	dataIdx := bytes.Index(event, dataPrefix)
@@ -208,9 +254,9 @@ func processSSEEvent(event []byte) []byte {
 	var newJSON []byte
 	switch eventType {
 	case "message_start":
-		newJSON = injectCacheIntoMessageStart(jsonData)
+		newJSON = injectCacheIntoMessageStart(model, jsonData)
 	case "message_delta":
-		newJSON = injectCacheIntoMessageDelta(jsonData)
+		newJSON = injectCacheIntoMessageDelta(model, jsonData)
 	default:
 		return nil
 	}
@@ -230,13 +276,13 @@ func processSSEEvent(event []byte) []byte {
 }
 
 // injectCacheIntoMessageStart adds cache simulation to a message_start event.
-func injectCacheIntoMessageStart(jsonData []byte) []byte {
+func injectCacheIntoMessageStart(model string, jsonData []byte) []byte {
 	inputTokens := gjson.GetBytes(jsonData, "message.usage.input_tokens")
 	if !inputTokens.Exists() || inputTokens.Int() <= 10 {
 		return nil
 	}
 
-	reduced, cacheRead, cacheCreation := simulateCacheUsage(inputTokens.Int())
+	reduced, cacheRead, cacheCreation := simulateCacheUsage(model, inputTokens.Int())
 
 	result := make([]byte, len(jsonData))
 	copy(result, jsonData)
@@ -244,13 +290,13 @@ func injectCacheIntoMessageStart(jsonData []byte) []byte {
 	result, _ = sjson.SetBytes(result, "message.usage.cache_read_input_tokens", cacheRead)
 	result, _ = sjson.SetBytes(result, "message.usage.cache_creation_input_tokens", cacheCreation)
 
-	log.Debugf("[CacheSim] message_start: input_tokens=%d -> reduced=%d, cache_read=%d, cache_creation=%d",
-		inputTokens.Int(), reduced, cacheRead, cacheCreation)
+	log.Debugf("[CacheSim] message_start: model=%s input_tokens=%d -> reduced=%d, cache_read=%d, cache_creation=%d",
+		model, inputTokens.Int(), reduced, cacheRead, cacheCreation)
 	return result
 }
 
 // injectCacheIntoMessageDelta adds cache simulation to a message_delta event.
-func injectCacheIntoMessageDelta(jsonData []byte) []byte {
+func injectCacheIntoMessageDelta(model string, jsonData []byte) []byte {
 	inputTokens := gjson.GetBytes(jsonData, "usage.input_tokens")
 	if !inputTokens.Exists() {
 		return nil
@@ -263,7 +309,7 @@ func injectCacheIntoMessageDelta(jsonData []byte) []byte {
 		return nil
 	}
 
-	reduced, cacheRead, cacheCreation := simulateCacheUsage(inputTokens.Int())
+	reduced, cacheRead, cacheCreation := simulateCacheUsage(model, inputTokens.Int())
 
 	result := make([]byte, len(jsonData))
 	copy(result, jsonData)
@@ -271,8 +317,8 @@ func injectCacheIntoMessageDelta(jsonData []byte) []byte {
 	result, _ = sjson.SetBytes(result, "usage.cache_read_input_tokens", cacheRead)
 	result, _ = sjson.SetBytes(result, "usage.cache_creation_input_tokens", cacheCreation)
 
-	log.Debugf("[CacheSim] message_delta: input_tokens=%d -> reduced=%d, cache_read=%d, cache_creation=%d",
-		inputTokens.Int(), reduced, cacheRead, cacheCreation)
+	log.Debugf("[CacheSim] message_delta: model=%s input_tokens=%d -> reduced=%d, cache_read=%d, cache_creation=%d",
+		model, inputTokens.Int(), reduced, cacheRead, cacheCreation)
 	return result
 }
 
@@ -282,29 +328,31 @@ func injectCacheIntoMessageDelta(jsonData []byte) []byte {
 
 // WrapStreamWithCacheSimulation wraps a streaming response converter function,
 // post-processing its output to inject cache simulation into SSE events.
+// The model parameter from the converter is used to select per-model config.
 func WrapStreamWithCacheSimulation(
 	original func(ctx context.Context, model string, origReq, req, raw []byte, param *any) [][]byte,
 ) func(ctx context.Context, model string, origReq, req, raw []byte, param *any) [][]byte {
 	return func(ctx context.Context, model string, origReq, req, raw []byte, param *any) [][]byte {
 		chunks := original(ctx, model, origReq, req, raw, param)
-		return injectCacheIntoSSEChunks(chunks)
+		return injectCacheIntoSSEChunks(model, chunks)
 	}
 }
 
 // WrapNonStreamWithCacheSimulation wraps a non-streaming response converter function,
 // post-processing its output to inject cache simulation into the JSON response.
+// The model parameter from the converter is used to select per-model config.
 func WrapNonStreamWithCacheSimulation(
 	original func(ctx context.Context, model string, origReq, req, raw []byte, param *any) []byte,
 ) func(ctx context.Context, model string, origReq, req, raw []byte, param *any) []byte {
 	return func(ctx context.Context, model string, origReq, req, raw []byte, param *any) []byte {
 		result := original(ctx, model, origReq, req, raw, param)
-		return injectCacheIntoNonStreamResponse(result)
+		return injectCacheIntoNonStreamResponse(model, result)
 	}
 }
 
 // injectCacheIntoNonStreamResponse post-processes a non-streaming JSON response
 // to inject cache simulation into the usage object.
-func injectCacheIntoNonStreamResponse(responseJSON []byte) []byte {
+func injectCacheIntoNonStreamResponse(model string, responseJSON []byte) []byte {
 	if len(responseJSON) == 0 {
 		return responseJSON
 	}
@@ -320,7 +368,7 @@ func injectCacheIntoNonStreamResponse(responseJSON []byte) []byte {
 		return responseJSON
 	}
 
-	reduced, cacheRead, cacheCreation := simulateCacheUsage(inputTokens.Int())
+	reduced, cacheRead, cacheCreation := simulateCacheUsage(model, inputTokens.Int())
 
 	result := make([]byte, len(responseJSON))
 	copy(result, responseJSON)
@@ -328,7 +376,7 @@ func injectCacheIntoNonStreamResponse(responseJSON []byte) []byte {
 	result, _ = sjson.SetBytes(result, "usage.cache_read_input_tokens", cacheRead)
 	result, _ = sjson.SetBytes(result, "usage.cache_creation_input_tokens", cacheCreation)
 
-	log.Debugf("[CacheSim] NonStream: input_tokens=%d -> reduced=%d, cache_read=%d, cache_creation=%d",
-		inputTokens.Int(), reduced, cacheRead, cacheCreation)
+	log.Debugf("[CacheSim] NonStream: model=%s input_tokens=%d -> reduced=%d, cache_read=%d, cache_creation=%d",
+		model, inputTokens.Int(), reduced, cacheRead, cacheCreation)
 	return result
 }
