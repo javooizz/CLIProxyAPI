@@ -26,51 +26,36 @@ import (
 // ---------------------------------------------------------------------------
 
 // CacheSimConfig controls the cache simulation parameters.
-// Adjust these to tune the simulated cost relative to real Anthropic caching.
+// Uses a probability model: most requests are pure cache hits (cache_creation=0),
+// only a small fraction of requests trigger cache writes.
 //
-// Cost formula (client-side): cost = input×base + cache_read×0.1×base + cache_creation×1.25×base
-// Primary cost lever is CacheCreationRate (1.25x pricing makes it dominant).
+// Token conservation: input_tokens + cache_read + cache_creation ≈ totalInput
+// This matches real Anthropic API behavior.
 type CacheSimConfig struct {
-	// CacheReadMultiplier controls cache_read = inputTokens × this value.
-	// Real Anthropic reports cached prefix tokens here; it can exceed inputTokens.
-	// Default 1.15 (115% of original).
-	CacheReadMultiplier float64
+	// CacheCreationProbability is the probability of a cache write per request.
+	// Real Anthropic creates cache only on new/changed system prompts or tool defs.
+	// Default 0.02 (2% of requests trigger cache creation).
+	CacheCreationProbability float64
 
-	// CacheReadJitter is the ± random variation on CacheReadMultiplier.
-	// Default 0.10 means the effective multiplier ranges in [1.05, 1.25].
-	CacheReadJitter float64
+	// CacheCreationMinRatio is the minimum fraction of total tokens used for
+	// cache_creation when a cache write occurs. Default 0.20.
+	CacheCreationMinRatio float64
 
-	// CacheCreationRate controls cache_creation = inputTokens × this value.
-	// This is the PRIMARY COST LEVER (priced at 1.25x base).
-	// Default 0.12. Tuning guide:
-	//   0.08 → ~5% above real Anthropic
-	//   0.12 → ~25% above real Anthropic
-	//   0.15 → ~40% above real Anthropic
-	CacheCreationRate float64
-
-	// CacheHitInputRate controls the reported input_tokens ratio on cache hit.
-	// Default 0.004 (0.4% of original — only new message tokens are uncached).
-	CacheHitInputRate float64
-
-	// CacheMissInputRate controls the reported input_tokens ratio on cache miss.
-	// Default 0.03 (3% of original — simulates cold start / compaction).
-	CacheMissInputRate float64
-
-	// CacheMissRate is the probability of a cache miss per request.
-	// Default 0.05 (5% of requests simulate cold start).
-	CacheMissRate float64
+	// CacheCreationMaxRatio is the maximum fraction of total tokens used for
+	// cache_creation when a cache write occurs. Default 0.50.
+	CacheCreationMaxRatio float64
 }
 
 // DefaultCacheSimConfig returns the default cache simulation parameters.
-// These defaults produce simulated costs ~25% above real Anthropic caching.
+// These defaults model realistic Anthropic caching behavior:
+//   - 98% of requests are pure cache hits (cache_creation = 0)
+//   - 2% of requests trigger cache writes (20%-50% of tokens)
+//   - Token conservation: input(1) + cache_read + cache_creation ≈ totalInput
 func DefaultCacheSimConfig() CacheSimConfig {
 	return CacheSimConfig{
-		CacheReadMultiplier: 1.15,
-		CacheReadJitter:     0.10,
-		CacheCreationRate:   0.12,
-		CacheHitInputRate:   0.008,
-		CacheMissInputRate:  0.03,
-		CacheMissRate:       0.05,
+		CacheCreationProbability: 0.02,
+		CacheCreationMinRatio:    0.20,
+		CacheCreationMaxRatio:    0.50,
 	}
 }
 
@@ -84,65 +69,54 @@ func ConfigureCacheSim(cfg CacheSimConfig) {
 	simConfig = cfg
 }
 
-// simulateCacheUsage generates fake prompt caching statistics to make
-// client-side usage displays (e.g. Claude Code) look realistic.
-// The upstream Antigravity API does not support Anthropic prompt caching,
-// but clients expect cache_read_input_tokens / cache_creation_input_tokens.
+// simulateCacheUsage generates fake prompt caching statistics using a
+// probability model that matches real Anthropic API behavior.
 //
-// Unlike the real Anthropic API, cache_read can exceed inputTokens (simulating
-// cached prefix re-reads). Token conservation is intentionally NOT enforced —
-// the goal is to produce realistic cost estimates in client billing displays.
+// Probability model:
+//   - 98% of requests → pure cache hit: input=1, cache_read=total-1, cache_creation=0
+//   - 2% of requests  → cache write:    input=1, cache_read=remainder, cache_creation=20~50%
+//
+// Token conservation: reducedInput + cacheRead + cacheCreation = totalInput
+// This ensures client-side billing calculations remain accurate.
 func simulateCacheUsage(inputTokens int64) (reducedInput, cacheRead, cacheCreation int64) {
-	if inputTokens <= 10 {
+	if inputTokens <= 1 {
 		return inputTokens, 0, 0
 	}
 
 	cfg := simConfig
-	ft := float64(inputTokens)
+	cacheTokens := inputTokens - 1 // reserve 1 token for input_tokens
 
-	// cache_read: ~115% of original tokens (cached system prompt / prior turns re-read).
-	readJitter := 1.0 + (rand.Float64()-0.5)*2.0*cfg.CacheReadJitter
-	cacheRead = int64(ft * cfg.CacheReadMultiplier * readJitter)
-	if cacheRead < 1 {
-		cacheRead = 1
-	}
+	if rand.Float64() < cfg.CacheCreationProbability {
+		// Cache write: 2% probability — new/changed system prompt or tool definitions.
+		// cache_creation = 20%~50% of total tokens.
+		ratio := cfg.CacheCreationMinRatio + rand.Float64()*(cfg.CacheCreationMaxRatio-cfg.CacheCreationMinRatio)
+		cacheCreation = int64(float64(inputTokens) * ratio)
+		if cacheCreation < 1 {
+			cacheCreation = 1
+		}
+		cacheRead = cacheTokens - cacheCreation
+		if cacheRead < 0 {
+			cacheRead = 0
+		}
 
-	// cache_creation: always present (~12% of original tokens — incremental cache writes).
-	// This is the primary cost driver due to 1.25x pricing.
-	creationJitter := 1.0 + (rand.Float64()-0.5)*0.4
-	cacheCreation = int64(ft * cfg.CacheCreationRate * creationJitter)
-	if cacheCreation < 1 {
-		cacheCreation = 1
-	}
-
-	// input_tokens: heavily reduced to simulate "most tokens served from cache".
-	isCacheMiss := rand.Float64() < cfg.CacheMissRate
-	if isCacheMiss {
-		// ~5% probability: cache miss (cold start / conversation compaction).
-		missJitter := 1.0 + (rand.Float64()-0.5)*0.6
-		reducedInput = int64(ft * cfg.CacheMissInputRate * missJitter)
+		log.Debugf("[CacheSim] CACHE WRITE: inputTokens=%d -> input=1, cache_read=%d, cache_creation=%d (ratio=%.2f)",
+			inputTokens, cacheRead, cacheCreation, ratio)
 	} else {
-		// ~95% probability: cache hit — only new message tokens are uncached.
-		hitJitter := 1.0 + (rand.Float64()-0.5)*0.6
-		reducedInput = int64(ft * cfg.CacheHitInputRate * hitJitter)
-	}
-	if reducedInput < 1 {
-		reducedInput = 1
+		// Cache hit: 98% probability — everything served from cache.
+		cacheRead = cacheTokens
+		cacheCreation = 0
+
+		log.Debugf("[CacheSim] cache hit: inputTokens=%d -> input=1, cache_read=%d, cache_creation=0",
+			inputTokens, cacheRead)
 	}
 
-	log.Debugf("[CacheSim] simulateCacheUsage: inputTokens=%d -> reducedInput=%d, cacheRead=%d, cacheCreation=%d",
-		inputTokens, reducedInput, cacheRead, cacheCreation)
+	reducedInput = 1
 	return
 }
 
 // ---------------------------------------------------------------------------
 // SSE event helpers
 // ---------------------------------------------------------------------------
-
-// sseEventBoundary is the double-newline separator between SSE events.
-// The upstream translator uses 3 trailing newlines per event ("\n\n\n"),
-// so we split on "\n\n" to find boundaries and keep the structure intact.
-var sseEventBoundary = []byte("\n\n")
 
 // injectCacheIntoSSEChunks post-processes a slice of SSE byte chunks,
 // injecting cache simulation into message_start and message_delta events.
