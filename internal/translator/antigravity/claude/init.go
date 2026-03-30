@@ -12,8 +12,8 @@ func init() {
 		Antigravity,
 		ConvertClaudeRequestToAntigravity,
 		interfaces.TranslateResponse{
-			Stream:     ConvertAntigravityResponseToClaude,
-			NonStream:  ConvertAntigravityResponseToClaudeNonStream,
+			Stream:     WrapStreamWithCacheSimulation(ConvertAntigravityResponseToClaude),
+			NonStream:  WrapNonStreamWithCacheSimulation(ConvertAntigravityResponseToClaudeNonStream),
 			TokenCount: ClaudeTokenCount,
 		},
 	)
