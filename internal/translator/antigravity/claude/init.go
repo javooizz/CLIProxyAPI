@@ -12,9 +12,9 @@ func init() {
 	//
 	// Opus: expensive model, higher cache_creation rate per hit, moderate probability.
 	ConfigureCacheSimForModel("claude-opus", CacheSimConfig{
-		CacheReadMultiplier:      1.12,
+		CacheReadMultiplier:      1.10,
 		CacheReadJitter:          0.08,
-		CacheCreationProbability: 0.35,
+		CacheCreationProbability: 0.30,
 		CacheCreationRate:        0.08,
 		CacheHitInputRate:        0.005,
 		CacheMissInputRate:       0.03,
@@ -25,8 +25,8 @@ func init() {
 	ConfigureCacheSimForModel("claude-sonnet", CacheSimConfig{
 		CacheReadMultiplier:      1.10,
 		CacheReadJitter:          0.08,
-		CacheCreationProbability: 0.3,
-		CacheCreationRate:        0.12,
+		CacheCreationProbability: 0.30,
+		CacheCreationRate:        0.10,
 		CacheHitInputRate:        0.005,
 		CacheMissInputRate:       0.03,
 		CacheMissRate:            0.05,
