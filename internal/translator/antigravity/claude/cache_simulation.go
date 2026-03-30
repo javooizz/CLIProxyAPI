@@ -70,8 +70,8 @@ func DefaultCacheSimConfig() CacheSimConfig {
 	return CacheSimConfig{
 		CacheReadMultiplier:      1.10,
 		CacheReadJitter:          0.08,
-		CacheCreationProbability: 0.25,
-		CacheCreationRate:        0.10,
+		CacheCreationProbability: 0.55,
+		CacheCreationRate:        0.03,
 		CacheHitInputRate:        0.005,
 		CacheMissInputRate:       0.03,
 		CacheMissRate:            0.05,
