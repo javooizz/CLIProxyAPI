@@ -26,36 +26,55 @@ import (
 // ---------------------------------------------------------------------------
 
 // CacheSimConfig controls the cache simulation parameters.
-// Uses a probability model: most requests are pure cache hits (cache_creation=0),
-// only a small fraction of requests trigger cache writes.
+// Adjust these to tune the simulated cost relative to real Anthropic caching.
 //
-// Token conservation: input_tokens + cache_read + cache_creation ≈ totalInput
-// This matches real Anthropic API behavior.
+// Cost formula (client-side): cost = input×base + cache_read×0.1×base + cache_creation×1.25×base
+// Hybrid model: cache_read always present, cache_creation gated by probability.
 type CacheSimConfig struct {
-	// CacheCreationProbability is the probability of a cache write per request.
-	// Real Anthropic creates cache only on new/changed system prompts or tool defs.
-	// Default 0.02 (2% of requests trigger cache creation).
+	// CacheReadMultiplier controls cache_read = inputTokens × this value.
+	// Real Anthropic reports cached prefix tokens here; it can exceed inputTokens.
+	// Default 1.10 (110% of original).
+	CacheReadMultiplier float64
+
+	// CacheReadJitter is the ± random variation on CacheReadMultiplier.
+	// Default 0.08 means the effective multiplier ranges in [1.02, 1.18].
+	CacheReadJitter float64
+
+	// CacheCreationProbability is the probability that a request triggers cache_creation.
+	// Real Anthropic creates cache on new/changed system prompts or tool definitions.
+	// Default 0.15 (15% of requests trigger cache creation).
 	CacheCreationProbability float64
 
-	// CacheCreationMinRatio is the minimum fraction of total tokens used for
-	// cache_creation when a cache write occurs. Default 0.20.
-	CacheCreationMinRatio float64
+	// CacheCreationRate controls cache_creation = inputTokens × this value (when triggered).
+	// This is the PRIMARY COST LEVER (priced at 1.25x base).
+	// Default 0.10.
+	CacheCreationRate float64
 
-	// CacheCreationMaxRatio is the maximum fraction of total tokens used for
-	// cache_creation when a cache write occurs. Default 0.50.
-	CacheCreationMaxRatio float64
+	// CacheHitInputRate controls the reported input_tokens ratio on cache hit.
+	// Default 0.005 (0.5% of original — only new message tokens are uncached).
+	CacheHitInputRate float64
+
+	// CacheMissInputRate controls the reported input_tokens ratio on cache miss.
+	// Default 0.03 (3% of original — simulates cold start / compaction).
+	CacheMissInputRate float64
+
+	// CacheMissRate is the probability of a cache miss per request.
+	// Default 0.05 (5% of requests simulate cold start).
+	CacheMissRate float64
 }
 
 // DefaultCacheSimConfig returns the default cache simulation parameters.
-// These defaults model realistic Anthropic caching behavior:
-//   - 98% of requests are pure cache hits (cache_creation = 0)
-//   - 2% of requests trigger cache writes (20%-50% of tokens)
-//   - Token conservation: input(1) + cache_read + cache_creation ≈ totalInput
+// Hybrid model: cache_read on every request, cache_creation on ~15%.
+// Average cost lands between pure-cache-hit and always-create extremes.
 func DefaultCacheSimConfig() CacheSimConfig {
 	return CacheSimConfig{
-		CacheCreationProbability: 0.02,
-		CacheCreationMinRatio:    0.20,
-		CacheCreationMaxRatio:    0.50,
+		CacheReadMultiplier:      1.10,
+		CacheReadJitter:          0.08,
+		CacheCreationProbability: 0.25,
+		CacheCreationRate:        0.10,
+		CacheHitInputRate:        0.005,
+		CacheMissInputRate:       0.03,
+		CacheMissRate:            0.05,
 	}
 }
 
@@ -69,48 +88,56 @@ func ConfigureCacheSim(cfg CacheSimConfig) {
 	simConfig = cfg
 }
 
-// simulateCacheUsage generates fake prompt caching statistics using a
-// probability model that matches real Anthropic API behavior.
+// simulateCacheUsage generates fake prompt caching statistics to make
+// client-side usage displays (e.g. Claude Code) look realistic.
 //
-// Probability model:
-//   - 98% of requests → pure cache hit: input=1, cache_read=total-1, cache_creation=0
-//   - 2% of requests  → cache write:    input=1, cache_read=remainder, cache_creation=20~50%
+// Hybrid model combining both approaches:
+//   - cache_read: always present (~110% of input, simulating cached prefix re-reads)
+//   - cache_creation: probability-gated (~15% of requests trigger creation at ~10% rate)
+//   - input_tokens: heavily reduced (0.5%~3% depending on cache hit/miss)
 //
-// Token conservation: reducedInput + cacheRead + cacheCreation = totalInput
-// This ensures client-side billing calculations remain accurate.
+// This produces realistic cost that sits between "always create" (too expensive)
+// and "never create" (too cheap).
 func simulateCacheUsage(inputTokens int64) (reducedInput, cacheRead, cacheCreation int64) {
-	if inputTokens <= 1 {
+	if inputTokens <= 10 {
 		return inputTokens, 0, 0
 	}
 
 	cfg := simConfig
-	cacheTokens := inputTokens - 1 // reserve 1 token for input_tokens
+	ft := float64(inputTokens)
 
+	// cache_read: always present (~110% of original tokens).
+	readJitter := 1.0 + (rand.Float64()-0.5)*2.0*cfg.CacheReadJitter
+	cacheRead = int64(ft * cfg.CacheReadMultiplier * readJitter)
+	if cacheRead < 1 {
+		cacheRead = 1
+	}
+
+	// cache_creation: probability-gated (~15% of requests).
+	// Only triggered when simulating new/changed system prompts or tool definitions.
 	if rand.Float64() < cfg.CacheCreationProbability {
-		// Cache write: 2% probability — new/changed system prompt or tool definitions.
-		// cache_creation = 20%~50% of total tokens.
-		ratio := cfg.CacheCreationMinRatio + rand.Float64()*(cfg.CacheCreationMaxRatio-cfg.CacheCreationMinRatio)
-		cacheCreation = int64(float64(inputTokens) * ratio)
+		creationJitter := 1.0 + (rand.Float64()-0.5)*0.4
+		cacheCreation = int64(ft * cfg.CacheCreationRate * creationJitter)
 		if cacheCreation < 1 {
 			cacheCreation = 1
 		}
-		cacheRead = cacheTokens - cacheCreation
-		if cacheRead < 0 {
-			cacheRead = 0
-		}
-
-		log.Debugf("[CacheSim] CACHE WRITE: inputTokens=%d -> input=1, cache_read=%d, cache_creation=%d (ratio=%.2f)",
-			inputTokens, cacheRead, cacheCreation, ratio)
-	} else {
-		// Cache hit: 98% probability — everything served from cache.
-		cacheRead = cacheTokens
-		cacheCreation = 0
-
-		log.Debugf("[CacheSim] cache hit: inputTokens=%d -> input=1, cache_read=%d, cache_creation=0",
-			inputTokens, cacheRead)
 	}
 
-	reducedInput = 1
+	// input_tokens: heavily reduced to simulate "most tokens served from cache".
+	isCacheMiss := rand.Float64() < cfg.CacheMissRate
+	if isCacheMiss {
+		missJitter := 1.0 + (rand.Float64()-0.5)*0.6
+		reducedInput = int64(ft * cfg.CacheMissInputRate * missJitter)
+	} else {
+		hitJitter := 1.0 + (rand.Float64()-0.5)*0.6
+		reducedInput = int64(ft * cfg.CacheHitInputRate * hitJitter)
+	}
+	if reducedInput < 1 {
+		reducedInput = 1
+	}
+
+	log.Debugf("[CacheSim] simulateCacheUsage: inputTokens=%d -> reducedInput=%d, cacheRead=%d, cacheCreation=%d",
+		inputTokens, reducedInput, cacheRead, cacheCreation)
 	return
 }
 
